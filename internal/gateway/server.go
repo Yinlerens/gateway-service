@@ -84,6 +84,12 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	if s.verifier == nil || s.internalToken == "" || len(s.routes) == 0 {
+		slog.Error(
+			"gateway not ready",
+			"verifier_configured", s.verifier != nil,
+			"internal_token_configured", s.internalToken != "",
+			"route_count", len(s.routes),
+		)
 		writeError(w, http.StatusServiceUnavailable, "gateway_not_ready", "gateway is not ready")
 		return
 	}
@@ -94,16 +100,36 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	route, ok := s.matchRoute(r.URL.Path)
 	if !ok {
+		slog.Warn(
+			"gateway request rejected",
+			"reason", "route_not_found",
+			"method", r.Method,
+			"path", r.URL.Path,
+		)
 		writeError(w, http.StatusNotFound, "not_found", "route not found")
 		return
 	}
 
 	accessToken, ok := extractAccessToken(r, s.authCookieName)
 	if !ok {
+		slog.Warn(
+			"gateway request rejected",
+			"reason", "missing_session",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"route", route.Name,
+		)
 		writeError(w, http.StatusUnauthorized, "unauthorized", "login is required")
 		return
 	}
 	if s.verifier == nil {
+		slog.Error(
+			"gateway request rejected",
+			"reason", "auth_verifier_missing",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"route", route.Name,
+		)
 		writeError(w, http.StatusServiceUnavailable, "auth_unavailable", "auth verifier is unavailable")
 		return
 	}
@@ -111,21 +137,52 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	user, err := s.verifier.Verify(r.Context(), accessToken)
 	if err != nil {
 		if errors.Is(err, ErrInvalidSession) {
+			slog.Warn(
+				"gateway request rejected",
+				"reason", "invalid_session",
+				"method", r.Method,
+				"path", r.URL.Path,
+				"route", route.Name,
+			)
 			writeError(w, http.StatusUnauthorized, "unauthorized", "login is required")
 			return
 		}
 
+		slog.Error(
+			"gateway auth verification failed",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"route", route.Name,
+			"error", err,
+		)
 		writeError(w, http.StatusServiceUnavailable, "auth_unavailable", "auth verifier is unavailable")
 		return
 	}
 
 	if r.ContentLength > s.maxBodyBytes {
+		slog.Warn(
+			"gateway request rejected",
+			"reason", "request_too_large",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"route", route.Name,
+			"content_length", r.ContentLength,
+			"max_body_bytes", s.maxBodyBytes,
+		)
 		writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body is too large")
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, s.maxBodyBytes)
 
 	if err := s.proxyAuthenticatedRequest(w, r, route, user); err != nil {
+		slog.Error(
+			"gateway upstream request failed",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"route", route.Name,
+			"target_host", route.Target.Host,
+			"error", err,
+		)
 		writeError(w, http.StatusBadGateway, "upstream_unavailable", "upstream service is unavailable")
 	}
 }
@@ -158,6 +215,28 @@ func (s *Server) proxyAuthenticatedRequest(w http.ResponseWriter, r *http.Reques
 		return err
 	}
 	defer response.Body.Close()
+
+	if response.StatusCode >= http.StatusInternalServerError {
+		slog.Error(
+			"gateway upstream returned error",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"route", route.Name,
+			"target_host", route.Target.Host,
+			"target_path", targetURL.Path,
+			"upstream_status", response.StatusCode,
+		)
+	} else if response.StatusCode >= http.StatusBadRequest {
+		slog.Warn(
+			"gateway upstream returned client error",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"route", route.Name,
+			"target_host", route.Target.Host,
+			"target_path", targetURL.Path,
+			"upstream_status", response.StatusCode,
+		)
+	}
 
 	copyResponseHeaders(w.Header(), response.Header)
 	w.WriteHeader(response.StatusCode)
