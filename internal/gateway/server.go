@@ -74,7 +74,6 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /ready", s.handleReady)
-	mux.HandleFunc("GET /__debug/panic", s.handleDebugPanic)
 	mux.HandleFunc("/", s.handleProxy)
 	return s.accessLog(securityHeaders(mux))
 }
@@ -96,10 +95,6 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
-}
-
-func (s *Server) handleDebugPanic(w http.ResponseWriter, r *http.Request) {
-	panic("debug native panic requested")
 }
 
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
@@ -393,8 +388,6 @@ func (s *Server) routeName(path string) string {
 		return "health"
 	case "/ready":
 		return "ready"
-	case "/__debug/panic":
-		return "debug"
 	}
 
 	route, ok := s.matchRoute(path)
