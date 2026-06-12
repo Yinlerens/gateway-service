@@ -1,0 +1,24 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: gateway-service
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: gateway-service
+    app.kubernetes.io/part-of: gateway-service
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/Yinlerens/gateway-service.git
+    targetRevision: main
+    path: k8s
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: gateway-service
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - PruneLast=true

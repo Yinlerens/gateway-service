@@ -1,0 +1,4 @@
+gateway-service
+*.exe
+*.test
+coverage.out

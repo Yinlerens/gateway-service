@@ -1,0 +1,93 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway-service
+  namespace: gateway-service
+  labels:
+    app.kubernetes.io/name: gateway-service
+    app.kubernetes.io/part-of: gateway-service
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gateway-service
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gateway-service
+        app.kubernetes.io/part-of: gateway-service
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: gateway-service
+          image: ghcr.io/yinlerens/gateway-service:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: PORT
+              value: "8080"
+            - name: REQUEST_TIMEOUT_SECONDS
+              value: "15"
+            - name: MAX_BODY_BYTES
+              value: "4194304"
+            - name: UPSTREAM_ROUTES
+              value: assets=/api/v1/assets|http://asset-service.asset-service.svc.cluster.local/v1,gacha=/api/v1/gacha|http://gacha-engine-service.gacha-engine-service.svc.cluster.local/v1,backpack=/api/v1/backpack|http://backpack-service.backpack-service.svc.cluster.local/v1
+            - name: SUPABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gateway-service-secrets
+                  key: supabase-url
+            - name: SUPABASE_ANON_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: gateway-service-secrets
+                  key: supabase-anon-key
+            - name: INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: gateway-service-secrets
+                  key: internal-token
+          startupProbe:
+            httpGet:
+              port: http
+              path: /health
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              port: http
+              path: /ready
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              port: http
+              path: /health
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
