@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -74,7 +75,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /ready", s.handleReady)
 	mux.HandleFunc("/", s.handleProxy)
-	return securityHeaders(mux)
+	return s.accessLog(securityHeaders(mux))
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -275,6 +276,74 @@ func securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (s *Server) accessLog(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started := time.Now()
+		response := &accessLogResponseWriter{ResponseWriter: w}
+
+		next.ServeHTTP(response, r)
+
+		status := response.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+
+		slog.Info(
+			"http request",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"route", s.routeName(r.URL.Path),
+			"status", status,
+			"duration_ms", time.Since(started).Milliseconds(),
+			"bytes", response.bytes,
+			"remote_ip", remoteIP(r.RemoteAddr),
+		)
+	})
+}
+
+func (s *Server) routeName(path string) string {
+	switch path {
+	case "/health":
+		return "health"
+	case "/ready":
+		return "ready"
+	}
+
+	route, ok := s.matchRoute(path)
+	if !ok {
+		return "unmatched"
+	}
+	return route.Name
+}
+
+type accessLogResponseWriter struct {
+	http.ResponseWriter
+	status int
+	bytes  int64
+}
+
+func (w *accessLogResponseWriter) WriteHeader(status int) {
+	if w.status != 0 {
+		return
+	}
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *accessLogResponseWriter) Write(payload []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+
+	written, err := w.ResponseWriter.Write(payload)
+	w.bytes += int64(written)
+	return written, err
+}
+
+func (w *accessLogResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
