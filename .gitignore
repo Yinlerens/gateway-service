@@ -1,4 +1,4 @@
-gateway-service
+/gateway-service
 *.exe
 *.test
 coverage.out
