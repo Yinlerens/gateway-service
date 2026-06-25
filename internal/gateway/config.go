@@ -16,14 +16,17 @@ const (
 )
 
 type Config struct {
-	Addr            string
-	SupabaseURL     string
-	SupabaseAnonKey string
-	InternalToken   string
-	AuthCookieName  string
-	Routes          []Route
-	RequestTimeout  time.Duration
-	MaxBodyBytes    int64
+	Addr              string
+	SupabaseURL       string
+	SupabaseAnonKey   string
+	InternalToken     string
+	AuthCookieName    string
+	Routes            []Route
+	RequestTimeout    time.Duration
+	MaxBodyBytes      int64
+	AuditDatabaseURL  string
+	AuditMaxBodyBytes int64
+	AuditWriteTimeout time.Duration
 }
 
 func LoadConfig() (Config, error) {
@@ -66,20 +69,37 @@ func LoadConfig() (Config, error) {
 		maxBodyBytes = parsed
 	}
 
+	auditMaxBodyBytes := int64(defaultAuditMaxBodyBytes)
+	if value := strings.TrimSpace(os.Getenv("AUDIT_MAX_BODY_BYTES")); value != "" {
+		parsed, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || parsed < 1 {
+			return Config{}, errors.New("AUDIT_MAX_BODY_BYTES must be a positive integer")
+		}
+		auditMaxBodyBytes = parsed
+	}
+
+	auditWriteTimeout, err := durationFromSecondsEnv("AUDIT_WRITE_TIMEOUT_SECONDS", int(defaultAuditWriteTimeout/time.Second))
+	if err != nil {
+		return Config{}, err
+	}
+
 	authCookieName := strings.TrimSpace(os.Getenv("SUPABASE_AUTH_COOKIE_NAME"))
 	if authCookieName == "" {
 		authCookieName = inferSupabaseCookieName(supabaseURL)
 	}
 
 	return Config{
-		Addr:            ":" + port,
-		SupabaseURL:     supabaseURL,
-		SupabaseAnonKey: supabaseAnonKey,
-		InternalToken:   internalToken,
-		AuthCookieName:  authCookieName,
-		Routes:          routes,
-		RequestTimeout:  requestTimeout,
-		MaxBodyBytes:    maxBodyBytes,
+		Addr:              ":" + port,
+		SupabaseURL:       supabaseURL,
+		SupabaseAnonKey:   supabaseAnonKey,
+		InternalToken:     internalToken,
+		AuthCookieName:    authCookieName,
+		Routes:            routes,
+		RequestTimeout:    requestTimeout,
+		MaxBodyBytes:      maxBodyBytes,
+		AuditDatabaseURL:  strings.TrimSpace(os.Getenv("AUDIT_DATABASE_URL")),
+		AuditMaxBodyBytes: auditMaxBodyBytes,
+		AuditWriteTimeout: auditWriteTimeout,
 	}, nil
 }
 

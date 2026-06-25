@@ -37,13 +37,26 @@ func run() error {
 		return err
 	}
 
+	var auditSink gateway.AuditSink
+	if cfg.AuditDatabaseURL != "" {
+		auditCtx, cancel := context.WithTimeout(context.Background(), cfg.AuditWriteTimeout)
+		auditSink, err = gateway.NewPostgresAuditSink(auditCtx, cfg.AuditDatabaseURL, cfg.AuditWriteTimeout)
+		cancel()
+		if err != nil {
+			return err
+		}
+		defer auditSink.Close()
+	}
+
 	api := gateway.New(gateway.Options{
-		Verifier:       verifier,
-		InternalToken:  cfg.InternalToken,
-		AuthCookieName: cfg.AuthCookieName,
-		Routes:         cfg.Routes,
-		Client:         gateway.TimeoutClient(cfg.RequestTimeout),
-		MaxBodyBytes:   cfg.MaxBodyBytes,
+		Verifier:          verifier,
+		InternalToken:     cfg.InternalToken,
+		AuthCookieName:    cfg.AuthCookieName,
+		Routes:            cfg.Routes,
+		Client:            gateway.TimeoutClient(cfg.RequestTimeout),
+		MaxBodyBytes:      cfg.MaxBodyBytes,
+		AuditSink:         auditSink,
+		AuditMaxBodyBytes: cfg.AuditMaxBodyBytes,
 	})
 
 	server := &http.Server{

@@ -1,6 +1,8 @@
 package gateway
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,21 +29,25 @@ type Route struct {
 }
 
 type Options struct {
-	Verifier       AuthVerifier
-	InternalToken  string
-	AuthCookieName string
-	Routes         []Route
-	Client         *http.Client
-	MaxBodyBytes   int64
+	Verifier          AuthVerifier
+	InternalToken     string
+	AuthCookieName    string
+	Routes            []Route
+	Client            *http.Client
+	MaxBodyBytes      int64
+	AuditSink         AuditSink
+	AuditMaxBodyBytes int64
 }
 
 type Server struct {
-	verifier       AuthVerifier
-	internalToken  string
-	authCookieName string
-	routes         []Route
-	client         *http.Client
-	maxBodyBytes   int64
+	verifier          AuthVerifier
+	internalToken     string
+	authCookieName    string
+	routes            []Route
+	client            *http.Client
+	maxBodyBytes      int64
+	auditSink         AuditSink
+	auditMaxBodyBytes int64
 }
 
 func New(opts Options) *Server {
@@ -61,12 +67,14 @@ func New(opts Options) *Server {
 	})
 
 	return &Server{
-		verifier:       opts.Verifier,
-		internalToken:  strings.TrimSpace(opts.InternalToken),
-		authCookieName: strings.TrimSpace(opts.AuthCookieName),
-		routes:         routes,
-		client:         client,
-		maxBodyBytes:   maxBodyBytes,
+		verifier:          opts.Verifier,
+		internalToken:     strings.TrimSpace(opts.InternalToken),
+		authCookieName:    strings.TrimSpace(opts.AuthCookieName),
+		routes:            routes,
+		client:            client,
+		maxBodyBytes:      maxBodyBytes,
+		auditSink:         opts.AuditSink,
+		auditMaxBodyBytes: normalizeAuditMaxBodyBytes(opts.AuditMaxBodyBytes),
 	}
 }
 
@@ -94,10 +102,70 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if s.auditSink != nil {
+		if err := s.auditSink.Ping(r.Context()); err != nil {
+			slog.Error("gateway audit sink not ready", "error", err)
+			writeError(w, http.StatusServiceUnavailable, "audit_unavailable", "audit sink is unavailable")
+			return
+		}
+	}
+
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
 
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
+	started := time.Now().UTC()
+	requestID, clientRequestID := requestIDsFromHeader(r.Header)
+	w.Header().Set(requestIDHeader, requestID.String())
+	r = r.WithContext(context.WithValue(r.Context(), requestIDContextKey{}, requestID.String()))
+
+	auditEntry := AuditEntry{
+		RequestID:       requestID,
+		ClientRequestID: clientRequestID,
+		StartedAt:       started,
+		Method:          r.Method,
+		Path:            r.URL.Path,
+		RawQuery:        r.URL.RawQuery,
+		RemoteIP:        remoteIP(r.RemoteAddr),
+		AuthResult:      "not_checked",
+		RequestHeaders:  sanitizedRequestHeaders(r.Header),
+		AuditStatus:     auditStatusStarted,
+	}
+
+	requestBody, auditBody, tooLarge, err := s.readProxyRequestBody(r)
+	auditEntry.RequestBody = auditBody
+	if err != nil {
+		slog.Warn("gateway request rejected", "reason", "request_body_unavailable", "method", r.Method, "path", r.URL.Path, "request_id", requestID.String(), "error", err)
+		if !s.startAuditOrFail(w, r, &auditEntry) {
+			return
+		}
+		s.writeAuditedError(w, r, &auditEntry, http.StatusBadRequest, "invalid_request_body", "request body could not be read")
+		return
+	}
+	r.Body = io.NopCloser(bytes.NewReader(requestBody))
+	r.ContentLength = int64(len(requestBody))
+
+	if tooLarge {
+		slog.Warn(
+			"gateway request rejected",
+			"reason", "request_too_large",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"content_length", r.ContentLength,
+			"max_body_bytes", s.maxBodyBytes,
+			"request_id", requestID.String(),
+		)
+		if !s.startAuditOrFail(w, r, &auditEntry) {
+			return
+		}
+		s.writeAuditedError(w, r, &auditEntry, http.StatusRequestEntityTooLarge, "request_too_large", "request body is too large")
+		return
+	}
+
+	if !s.startAuditOrFail(w, r, &auditEntry) {
+		return
+	}
+
 	route, ok := s.matchRoute(r.URL.Path)
 	if !ok {
 		slog.Warn(
@@ -105,10 +173,13 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			"reason", "route_not_found",
 			"method", r.Method,
 			"path", r.URL.Path,
+			"request_id", requestID.String(),
 		)
-		writeError(w, http.StatusNotFound, "not_found", "route not found")
+		auditEntry.AuthResult = "route_not_found"
+		s.writeAuditedError(w, r, &auditEntry, http.StatusNotFound, "not_found", "route not found")
 		return
 	}
+	auditEntry.Route = route.Name
 
 	accessToken, ok := extractAccessToken(r, s.authCookieName)
 	if !ok {
@@ -118,8 +189,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			"method", r.Method,
 			"path", r.URL.Path,
 			"route", route.Name,
+			"request_id", requestID.String(),
 		)
-		writeError(w, http.StatusUnauthorized, "unauthorized", "login is required")
+		auditEntry.AuthResult = "missing_session"
+		s.writeAuditedError(w, r, &auditEntry, http.StatusUnauthorized, "unauthorized", "login is required")
 		return
 	}
 	if s.verifier == nil {
@@ -129,8 +202,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			"method", r.Method,
 			"path", r.URL.Path,
 			"route", route.Name,
+			"request_id", requestID.String(),
 		)
-		writeError(w, http.StatusServiceUnavailable, "auth_unavailable", "auth verifier is unavailable")
+		auditEntry.AuthResult = "auth_verifier_missing"
+		s.writeAuditedError(w, r, &auditEntry, http.StatusServiceUnavailable, "auth_unavailable", "auth verifier is unavailable")
 		return
 	}
 
@@ -143,8 +218,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 				"method", r.Method,
 				"path", r.URL.Path,
 				"route", route.Name,
+				"request_id", requestID.String(),
 			)
-			writeError(w, http.StatusUnauthorized, "unauthorized", "login is required")
+			auditEntry.AuthResult = "invalid_session"
+			s.writeAuditedError(w, r, &auditEntry, http.StatusUnauthorized, "unauthorized", "login is required")
 			return
 		}
 
@@ -154,27 +231,17 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			"path", r.URL.Path,
 			"route", route.Name,
 			"error", err,
+			"request_id", requestID.String(),
 		)
-		writeError(w, http.StatusServiceUnavailable, "auth_unavailable", "auth verifier is unavailable")
+		auditEntry.AuthResult = "auth_verification_failed"
+		s.writeAuditedError(w, r, &auditEntry, http.StatusServiceUnavailable, "auth_unavailable", "auth verifier is unavailable")
 		return
 	}
+	auditEntry.AuthResult = "authenticated"
+	auditEntry.UserID = &user.ID
 
-	if r.ContentLength > s.maxBodyBytes {
-		slog.Warn(
-			"gateway request rejected",
-			"reason", "request_too_large",
-			"method", r.Method,
-			"path", r.URL.Path,
-			"route", route.Name,
-			"content_length", r.ContentLength,
-			"max_body_bytes", s.maxBodyBytes,
-		)
-		writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body is too large")
-		return
-	}
-	r.Body = http.MaxBytesReader(w, r.Body, s.maxBodyBytes)
-
-	if err := s.proxyAuthenticatedRequest(w, r, route, user); err != nil {
+	result, err := s.proxyAuthenticatedRequest(r, route, user)
+	if err != nil {
 		slog.Error(
 			"gateway upstream request failed",
 			"method", r.Method,
@@ -182,9 +249,22 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			"route", route.Name,
 			"target_host", route.Target.Host,
 			"error", err,
+			"request_id", requestID.String(),
 		)
-		writeError(w, http.StatusBadGateway, "upstream_unavailable", "upstream service is unavailable")
+		s.writeAuditedError(w, r, &auditEntry, http.StatusBadGateway, "upstream_unavailable", "upstream service is unavailable")
+		return
 	}
+
+	auditEntry.UpstreamURL = result.TargetURL
+	auditEntry.ResponseStatus = result.StatusCode
+	auditEntry.ResponseHeaders = sanitizedResponseHeaders(result.Header)
+	auditEntry.ResponseBody = result.AuditBody
+	auditEntry.AuditStatus = auditStatusComplete
+	s.finishAudit(r.Context(), &auditEntry)
+
+	copyResponseHeaders(w.Header(), result.Header)
+	w.WriteHeader(result.StatusCode)
+	_, _ = w.Write(result.Body)
 }
 
 func (s *Server) matchRoute(path string) (Route, bool) {
@@ -197,24 +277,124 @@ func (s *Server) matchRoute(path string) (Route, bool) {
 	return Route{}, false
 }
 
-func (s *Server) proxyAuthenticatedRequest(w http.ResponseWriter, r *http.Request, route Route, user User) error {
+func (s *Server) readProxyRequestBody(r *http.Request) ([]byte, AuditBody, bool, error) {
+	if r.Body == nil {
+		return nil, AuditBody{Encoding: bodyEncodingUTF8}, false, nil
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, s.maxBodyBytes+1))
+	if err != nil {
+		return nil, AuditBody{}, false, err
+	}
+
+	tooLarge := int64(len(body)) > s.maxBodyBytes
+	originalSize := len(body)
+	if tooLarge {
+		body = body[:s.maxBodyBytes]
+	}
+
+	return body, auditBodyFromBytesWithOriginalSize(body, r.Header.Get("Content-Type"), s.auditMaxBodyBytes, originalSize), tooLarge, nil
+}
+
+func (s *Server) startAuditOrFail(w http.ResponseWriter, r *http.Request, entry *AuditEntry) bool {
+	if s.auditSink == nil {
+		return true
+	}
+
+	if err := s.auditSink.Start(r.Context(), *entry); err != nil {
+		slog.Error(
+			"gateway audit start failed",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"request_id", entry.RequestID.String(),
+			"error", err,
+		)
+		writeError(w, http.StatusServiceUnavailable, "audit_unavailable", "audit sink is unavailable")
+		return false
+	}
+
+	return true
+}
+
+func (s *Server) writeAuditedError(w http.ResponseWriter, r *http.Request, entry *AuditEntry, statusCode int, code string, message string) {
+	payload, _ := json.Marshal(errorResponse{
+		Error: apiError{
+			Code:    code,
+			Message: message,
+		},
+	})
+
+	headers := http.Header{}
+	headers.Set("Content-Type", "application/json")
+
+	entry.ResponseStatus = statusCode
+	entry.ResponseHeaders = sanitizedResponseHeaders(headers)
+	entry.ResponseBody = auditBodyFromBytes(payload, "application/json", s.auditMaxBodyBytes)
+	entry.ErrorCode = code
+	entry.ErrorMessage = message
+	entry.AuditStatus = auditStatusComplete
+	s.finishAudit(r.Context(), entry)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	_, _ = w.Write(payload)
+}
+
+func (s *Server) finishAudit(ctx context.Context, entry *AuditEntry) {
+	if s.auditSink == nil {
+		return
+	}
+
+	entry.FinishedAt = time.Now().UTC()
+	entry.Duration = entry.FinishedAt.Sub(entry.StartedAt)
+	if entry.AuditStatus == "" {
+		entry.AuditStatus = auditStatusComplete
+	}
+
+	if err := s.auditSink.Finish(ctx, *entry); err != nil {
+		slog.Error(
+			"gateway audit finish failed",
+			"request_id", entry.RequestID.String(),
+			"method", entry.Method,
+			"path", entry.Path,
+			"status", entry.ResponseStatus,
+			"error", err,
+		)
+	}
+}
+
+type proxyResult struct {
+	StatusCode int
+	Header     http.Header
+	Body       []byte
+	AuditBody  AuditBody
+	TargetURL  string
+}
+
+func (s *Server) proxyAuthenticatedRequest(r *http.Request, route Route, user User) (proxyResult, error) {
 	targetURL := buildTargetURL(route, r.URL)
 
 	request, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL.String(), r.Body)
 	if err != nil {
-		return err
+		return proxyResult{}, err
 	}
 	request.ContentLength = r.ContentLength
 	copyForwardHeaders(request.Header, r.Header)
 	request.Header.Set(internalTokenHeader, s.internalToken)
 	request.Header.Set(userIDHeader, user.ID.String())
+	request.Header.Set(requestIDHeader, requestIDFromContext(r.Context()))
 	setForwardedHeaders(request, r)
 
 	response, err := s.client.Do(request)
 	if err != nil {
-		return err
+		return proxyResult{}, err
 	}
 	defer response.Body.Close()
+
+	auditBody, responseBody, err := readResponseAuditBody(response.Body, response.Header.Get("Content-Type"), s.auditMaxBodyBytes)
+	if err != nil {
+		return proxyResult{}, err
+	}
 
 	if response.StatusCode >= http.StatusInternalServerError {
 		slog.Error(
@@ -225,6 +405,7 @@ func (s *Server) proxyAuthenticatedRequest(w http.ResponseWriter, r *http.Reques
 			"target_host", route.Target.Host,
 			"target_path", targetURL.Path,
 			"upstream_status", response.StatusCode,
+			"request_id", requestIDFromContext(r.Context()),
 		)
 	} else if response.StatusCode >= http.StatusBadRequest {
 		slog.Warn(
@@ -235,13 +416,17 @@ func (s *Server) proxyAuthenticatedRequest(w http.ResponseWriter, r *http.Reques
 			"target_host", route.Target.Host,
 			"target_path", targetURL.Path,
 			"upstream_status", response.StatusCode,
+			"request_id", requestIDFromContext(r.Context()),
 		)
 	}
 
-	copyResponseHeaders(w.Header(), response.Header)
-	w.WriteHeader(response.StatusCode)
-	_, err = io.Copy(w, response.Body)
-	return err
+	return proxyResult{
+		StatusCode: response.StatusCode,
+		Header:     response.Header.Clone(),
+		Body:       responseBody,
+		AuditBody:  auditBody,
+		TargetURL:  targetURL.String(),
+	}, nil
 }
 
 func buildTargetURL(route Route, source *url.URL) url.URL {
@@ -349,6 +534,16 @@ func remoteIP(remoteAddr string) string {
 	return remoteAddr
 }
 
+type requestIDContextKey struct{}
+
+func requestIDFromContext(ctx context.Context) string {
+	requestID, ok := ctx.Value(requestIDContextKey{}).(string)
+	if !ok {
+		return ""
+	}
+	return requestID
+}
+
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -368,9 +563,14 @@ func (s *Server) accessLog(next http.Handler) http.Handler {
 		if status == 0 {
 			status = http.StatusOK
 		}
+		requestID := requestIDFromContext(r.Context())
+		if requestID == "" {
+			requestID = response.Header().Get(requestIDHeader)
+		}
 
 		slog.Info(
 			"http request",
+			"request_id", requestID,
 			"method", r.Method,
 			"path", r.URL.Path,
 			"route", s.routeName(r.URL.Path),

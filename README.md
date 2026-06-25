@@ -26,6 +26,23 @@ Go 网关服务负责承接前端请求，在调用内部微服务之前统一�
 
 客户端伪造的 `X-Internal-Token`、`X-User-Id`、`Authorization` 和 `Cookie` 都会在转发前被移除。
 
+## 接口审计
+
+网关会为所有前端业务接口生成或透传 `X-Request-Id`，并把请求/响应审计写入 Supabase Postgres 的 `audit.http_api_calls` 表。`/health` 和 `/ready` 只用于探针，不进入业务审计。
+
+审计内容包括：
+
+- 请求方法、路径、query、路由、用户 ID、远端 IP、鉴权结果、上游 URL、状态码、耗时
+- 脱敏后的请求头和响应头
+- 请求体、响应体原文；JSON 请求/响应会额外保存为 `jsonb`
+- 非 UTF-8 body 保存为 base64；超出 `AUDIT_MAX_BODY_BYTES` 的内容会标记 `*_truncated`
+
+不会写入审计的头包括 `Authorization`、`Cookie`、`Proxy-Authorization`、`X-Internal-Token`、`X-User-Id`、API key 相关头和响应 `Set-Cookie`。
+
+审计是 fail closed：配置了 `AUDIT_DATABASE_URL` 时，如果审计开始记录失败，网关不会继续鉴权或转发该请求，直接返回 `503 audit_unavailable`。
+
+建表 SQL 在 `db/audit_schema.sql`。表位于私有 `audit` schema，默认不给 `anon` / `authenticated` 直接读取权限。
+
 ## 配置
 
 必填环境变量：
@@ -44,6 +61,9 @@ PORT=8080
 SUPABASE_AUTH_COOKIE_NAME=sb-<project-ref>-auth-token
 REQUEST_TIMEOUT_SECONDS=15
 MAX_BODY_BYTES=4194304
+AUDIT_DATABASE_URL=postgresql://...
+AUDIT_MAX_BODY_BYTES=4194304
+AUDIT_WRITE_TIMEOUT_SECONDS=3
 ```
 
 如果只接资产服务，也可以用：

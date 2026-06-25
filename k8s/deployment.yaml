@@ -43,6 +43,10 @@ spec:
               value: "15"
             - name: MAX_BODY_BYTES
               value: "4194304"
+            - name: AUDIT_MAX_BODY_BYTES
+              value: "4194304"
+            - name: AUDIT_WRITE_TIMEOUT_SECONDS
+              value: "3"
             - name: UPSTREAM_ROUTES
               value: assets=/api/v1/assets|http://asset-service.asset-service.svc.cluster.local/v1,gacha=/api/v1/gacha|http://gacha-engine-service.gacha-engine-service.svc.cluster.local/v1,backpack=/api/v1/backpack|http://backpack-service.backpack-service.svc.cluster.local/v1
             - name: SUPABASE_URL
@@ -60,6 +64,11 @@ spec:
                 secretKeyRef:
                   name: gateway-service-secrets
                   key: internal-token
+            - name: AUDIT_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gateway-service-secrets
+                  key: audit-database-url
           startupProbe:
             httpGet:
               port: http
