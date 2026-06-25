@@ -28,7 +28,7 @@ Go 网关服务负责承接前端请求，在调用内部微服务之前统一�
 
 ## 接口审计
 
-网关会为所有前端业务接口生成或透传 `X-Request-Id`，并把请求/响应审计写入 Supabase Postgres 的 `audit.http_api_calls` 表。`/health` 和 `/ready` 只用于探针，不进入业务审计。
+网关会为所有前端业务接口生成或透传 `X-Request-Id`，并把请求/响应审计写入业务 Postgres 的 `audit.http_api_calls` 表。`/health` 和 `/ready` 只用于探针，不进入业务审计。
 
 审计内容包括：
 
@@ -41,7 +41,7 @@ Go 网关服务负责承接前端请求，在调用内部微服务之前统一�
 
 审计是 fail closed：配置了 `AUDIT_DATABASE_URL` 时，如果审计开始记录失败，网关不会继续鉴权或转发该请求，直接返回 `503 audit_unavailable`。
 
-建表 SQL 在 `db/audit_schema.sql`。表位于私有 `audit` schema，默认不给 `anon` / `authenticated` 直接读取权限。
+建表 SQL 在 `db/audit_schema.sql`。表位于 `audit` schema，应该使用网关后端的数据库账号访问，不给前端直连读取完整 body。
 
 ## 配置
 

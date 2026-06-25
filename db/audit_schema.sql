@@ -54,14 +54,3 @@ create index if not exists http_api_calls_status_started_idx
   on audit.http_api_calls (response_status, started_at desc);
 
 alter table audit.http_api_calls enable row level security;
-
-revoke all on schema audit from anon, authenticated;
-revoke all on audit.http_api_calls from anon, authenticated;
-
-do $$
-begin
-  if exists (select 1 from pg_roles where rolname = 'service_role') then
-    execute 'grant usage on schema audit to service_role';
-    execute 'grant select, insert, update, delete on all tables in schema audit to service_role';
-  end if;
-end $$;
