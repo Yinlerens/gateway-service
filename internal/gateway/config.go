@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 const (
@@ -16,17 +18,18 @@ const (
 )
 
 type Config struct {
-	Addr              string
-	SupabaseURL       string
-	SupabaseAnonKey   string
-	InternalToken     string
-	AuthCookieName    string
-	Routes            []Route
-	RequestTimeout    time.Duration
-	MaxBodyBytes      int64
-	AuditDatabaseURL  string
-	AuditMaxBodyBytes int64
-	AuditWriteTimeout time.Duration
+	Addr                 string
+	SupabaseURL          string
+	SupabaseAnonKey      string
+	InternalToken        string
+	AuthCookieName       string
+	Routes               []Route
+	RequestTimeout       time.Duration
+	MaxBodyBytes         int64
+	AuditDatabaseURL     string
+	AuditMaxBodyBytes    int64
+	AuditWriteTimeout    time.Duration
+	AuditLogAdminUserIDs map[uuid.UUID]struct{}
 }
 
 func LoadConfig() (Config, error) {
@@ -88,18 +91,24 @@ func LoadConfig() (Config, error) {
 		authCookieName = inferSupabaseCookieName(supabaseURL)
 	}
 
+	auditLogAdminUserIDs, err := uuidSetFromEnv("AUDIT_LOG_ADMIN_USER_IDS")
+	if err != nil {
+		return Config{}, err
+	}
+
 	return Config{
-		Addr:              ":" + port,
-		SupabaseURL:       supabaseURL,
-		SupabaseAnonKey:   supabaseAnonKey,
-		InternalToken:     internalToken,
-		AuthCookieName:    authCookieName,
-		Routes:            routes,
-		RequestTimeout:    requestTimeout,
-		MaxBodyBytes:      maxBodyBytes,
-		AuditDatabaseURL:  strings.TrimSpace(os.Getenv("AUDIT_DATABASE_URL")),
-		AuditMaxBodyBytes: auditMaxBodyBytes,
-		AuditWriteTimeout: auditWriteTimeout,
+		Addr:                 ":" + port,
+		SupabaseURL:          supabaseURL,
+		SupabaseAnonKey:      supabaseAnonKey,
+		InternalToken:        internalToken,
+		AuthCookieName:       authCookieName,
+		Routes:               routes,
+		RequestTimeout:       requestTimeout,
+		MaxBodyBytes:         maxBodyBytes,
+		AuditDatabaseURL:     strings.TrimSpace(os.Getenv("AUDIT_DATABASE_URL")),
+		AuditMaxBodyBytes:    auditMaxBodyBytes,
+		AuditWriteTimeout:    auditWriteTimeout,
+		AuditLogAdminUserIDs: auditLogAdminUserIDs,
 	}, nil
 }
 
@@ -173,6 +182,30 @@ func durationFromSecondsEnv(name string, defaultSeconds int) (time.Duration, err
 	}
 
 	return time.Duration(seconds) * time.Second, nil
+}
+
+func uuidSetFromEnv(name string) (map[uuid.UUID]struct{}, error) {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return nil, nil
+	}
+
+	parts := strings.Split(value, ",")
+	result := make(map[uuid.UUID]struct{}, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+
+		id, err := uuid.Parse(part)
+		if err != nil {
+			return nil, fmt.Errorf("%s must contain comma-separated UUIDs", name)
+		}
+		result[id] = struct{}{}
+	}
+
+	return result, nil
 }
 
 func inferSupabaseCookieName(supabaseURL string) string {

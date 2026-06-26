@@ -43,6 +43,38 @@ Go 网关服务负责承接前端请求，在调用内部微服务之前统一�
 
 建表 SQL 在 `db/audit_schema.sql`。表位于 `audit` schema，应该使用网关后端的数据库账号访问，不给前端直连读取完整 body。
 
+### 审计日志查询接口
+
+网关提供管理员专用的审计日志查询接口。接口仍然使用 Supabase 登录态鉴权，但只有 `AUDIT_LOG_ADMIN_USER_IDS` 中配置的 Supabase user UUID 可以访问；未配置时默认拒绝。
+
+列表接口只返回请求/响应 body 预览，适合前端表格筛选：
+
+```http
+GET /api/v1/admin/audit/http-api-calls?limit=50&path=/gacha&route=gacha&status=502
+Authorization: Bearer <supabase access token>
+```
+
+支持的查询参数：
+
+- `limit`：返回条数，默认 50，最大 200
+- `request_id`：精确匹配请求 ID
+- `user_id`：精确匹配 Supabase 用户 ID
+- `method`：HTTP 方法
+- `path`：路径包含匹配
+- `route`：网关路由名，例如 `assets`、`gacha`、`backpack`
+- `auth_result`：鉴权结果，例如 `authenticated`、`missing_session`、`forbidden`
+- `status`：HTTP 响应状态码
+- `since` / `until`：RFC3339 时间范围，按 `started_at` 过滤
+
+详情接口按请求 ID 返回完整请求/响应头和 body：
+
+```http
+GET /api/v1/admin/audit/http-api-calls/{request_id}
+Authorization: Bearer <supabase access token>
+```
+
+这些管理接口本身也会进入审计表。
+
 ## 配置
 
 必填环境变量：
@@ -64,6 +96,7 @@ MAX_BODY_BYTES=4194304
 AUDIT_DATABASE_URL=postgresql://...
 AUDIT_MAX_BODY_BYTES=4194304
 AUDIT_WRITE_TIMEOUT_SECONDS=3
+AUDIT_LOG_ADMIN_USER_IDS=<supabase-user-uuid>[,<supabase-user-uuid>...]
 ```
 
 如果只接资产服务，也可以用：

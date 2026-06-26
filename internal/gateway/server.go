@@ -14,6 +14,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 const (
@@ -36,7 +38,9 @@ type Options struct {
 	Client            *http.Client
 	MaxBodyBytes      int64
 	AuditSink         AuditSink
+	AuditLogStore     AuditLogStore
 	AuditMaxBodyBytes int64
+	AdminUserIDs      map[uuid.UUID]struct{}
 }
 
 type Server struct {
@@ -47,7 +51,9 @@ type Server struct {
 	client            *http.Client
 	maxBodyBytes      int64
 	auditSink         AuditSink
+	auditLogStore     AuditLogStore
 	auditMaxBodyBytes int64
+	adminUserIDs      map[uuid.UUID]struct{}
 }
 
 func New(opts Options) *Server {
@@ -66,6 +72,18 @@ func New(opts Options) *Server {
 		return len(routes[i].Prefix) > len(routes[j].Prefix)
 	})
 
+	auditLogStore := opts.AuditLogStore
+	if auditLogStore == nil {
+		if store, ok := opts.AuditSink.(AuditLogStore); ok {
+			auditLogStore = store
+		}
+	}
+
+	adminUserIDs := make(map[uuid.UUID]struct{}, len(opts.AdminUserIDs))
+	for id := range opts.AdminUserIDs {
+		adminUserIDs[id] = struct{}{}
+	}
+
 	return &Server{
 		verifier:          opts.Verifier,
 		internalToken:     strings.TrimSpace(opts.InternalToken),
@@ -74,7 +92,9 @@ func New(opts Options) *Server {
 		client:            client,
 		maxBodyBytes:      maxBodyBytes,
 		auditSink:         opts.AuditSink,
+		auditLogStore:     auditLogStore,
 		auditMaxBodyBytes: normalizeAuditMaxBodyBytes(opts.AuditMaxBodyBytes),
+		adminUserIDs:      adminUserIDs,
 	}
 }
 
@@ -82,6 +102,8 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /ready", s.handleReady)
+	mux.HandleFunc("GET /api/v1/admin/audit/http-api-calls", s.handleAuditLogList)
+	mux.HandleFunc("GET /api/v1/admin/audit/http-api-calls/{request_id}", s.handleAuditLogDetail)
 	mux.HandleFunc("/", s.handleProxy)
 	return s.accessLog(securityHeaders(mux))
 }
@@ -588,6 +610,9 @@ func (s *Server) routeName(path string) string {
 		return "health"
 	case "/ready":
 		return "ready"
+	}
+	if path == "/api/v1/admin/audit/http-api-calls" || strings.HasPrefix(path, "/api/v1/admin/audit/http-api-calls/") {
+		return auditAdminRouteName
 	}
 
 	route, ok := s.matchRoute(path)

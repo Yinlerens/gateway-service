@@ -69,6 +69,12 @@ spec:
                 secretKeyRef:
                   name: gateway-service-secrets
                   key: audit-database-url
+            - name: AUDIT_LOG_ADMIN_USER_IDS
+              valueFrom:
+                secretKeyRef:
+                  name: gateway-service-secrets
+                  key: audit-log-admin-user-ids
+                  optional: true
           startupProbe:
             httpGet:
               port: http

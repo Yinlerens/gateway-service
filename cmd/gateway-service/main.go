@@ -57,6 +57,7 @@ func run() error {
 		MaxBodyBytes:      cfg.MaxBodyBytes,
 		AuditSink:         auditSink,
 		AuditMaxBodyBytes: cfg.AuditMaxBodyBytes,
+		AdminUserIDs:      cfg.AuditLogAdminUserIDs,
 	})
 
 	server := &http.Server{
