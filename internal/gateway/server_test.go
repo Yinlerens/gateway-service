@@ -38,6 +38,32 @@ type fakeAuditSink struct {
 	closed    bool
 }
 
+type fakeAuditLogStore struct {
+	listFilter AuditLogFilter
+	listItems  []json.RawMessage
+	listErr    error
+	getID      uuid.UUID
+	getItem    json.RawMessage
+	getFound   bool
+	getErr     error
+}
+
+func (f *fakeAuditLogStore) ListHTTPAPICalls(ctx context.Context, filter AuditLogFilter) ([]json.RawMessage, error) {
+	f.listFilter = filter
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	return f.listItems, nil
+}
+
+func (f *fakeAuditLogStore) GetHTTPAPICall(ctx context.Context, requestID uuid.UUID) (json.RawMessage, bool, error) {
+	f.getID = requestID
+	if f.getErr != nil {
+		return nil, false, f.getErr
+	}
+	return f.getItem, f.getFound, nil
+}
+
 func (f *fakeAuditSink) Ping(ctx context.Context) error {
 	return f.pingErr
 }
@@ -336,6 +362,131 @@ func TestAuditStartFailureFailsClosedBeforeAuthAndProxy(t *testing.T) {
 	}
 }
 
+func TestAuditLogListRequiresLogin(t *testing.T) {
+	audit := &fakeAuditSink{}
+	store := &fakeAuditLogStore{}
+	api := newTestServerWithAuditLogs(t, &fakeVerifier{}, "http://example.test/v1", audit, store, uuid.New())
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/admin/audit/http-api-calls", nil)
+	response := httptest.NewRecorder()
+
+	api.Handler().ServeHTTP(response, request)
+
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d: %s", response.Code, response.Body.String())
+	}
+	if len(store.listItems) != 0 || store.listFilter.Limit != 0 {
+		t.Fatal("expected audit log store not to be called")
+	}
+	if len(audit.starts) != 1 || len(audit.finishes) != 1 {
+		t.Fatalf("expected audit record for denied admin request, got %d starts and %d finishes", len(audit.starts), len(audit.finishes))
+	}
+	if audit.finishes[0].ResponseStatus != http.StatusUnauthorized {
+		t.Fatalf("expected audited 401, got %d", audit.finishes[0].ResponseStatus)
+	}
+}
+
+func TestAuditLogListRejectsNonAdminUser(t *testing.T) {
+	userID := uuid.New()
+	audit := &fakeAuditSink{}
+	store := &fakeAuditLogStore{}
+	api := newTestServerWithAuditLogs(t, &fakeVerifier{user: User{ID: userID}}, "http://example.test/v1", audit, store, uuid.New())
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/admin/audit/http-api-calls", nil)
+	request.Header.Set("Authorization", "Bearer valid-token")
+	response := httptest.NewRecorder()
+
+	api.Handler().ServeHTTP(response, request)
+
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d: %s", response.Code, response.Body.String())
+	}
+	if len(store.listItems) != 0 || store.listFilter.Limit != 0 {
+		t.Fatal("expected audit log store not to be called")
+	}
+	if len(audit.finishes) != 1 || audit.finishes[0].UserID == nil || *audit.finishes[0].UserID != userID {
+		t.Fatalf("expected audit finish to include user id, got %+v", audit.finishes)
+	}
+}
+
+func TestAuditLogListReturnsFilteredRowsForAdmin(t *testing.T) {
+	adminID := uuid.New()
+	targetRequestID := uuid.New()
+	targetUserID := uuid.New()
+	audit := &fakeAuditSink{}
+	store := &fakeAuditLogStore{
+		listItems: []json.RawMessage{
+			json.RawMessage(`{"request_id":"` + targetRequestID.String() + `","path":"/api/v1/gacha/me/pulls"}`),
+		},
+	}
+	api := newTestServerWithAuditLogs(t, &fakeVerifier{user: User{ID: adminID}}, "http://example.test/v1", audit, store, adminID)
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/admin/audit/http-api-calls?limit=25&path=/gacha&route=gacha&status=502&user_id="+targetUserID.String()+"&request_id="+targetRequestID.String(), nil)
+	request.Header.Set("Authorization", "Bearer admin-token")
+	response := httptest.NewRecorder()
+
+	api.Handler().ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", response.Code, response.Body.String())
+	}
+	if store.listFilter.Limit != 25 {
+		t.Fatalf("expected limit 25, got %d", store.listFilter.Limit)
+	}
+	if store.listFilter.PathContains != "/gacha" || store.listFilter.Route != "gacha" {
+		t.Fatalf("unexpected filter path/route: %+v", store.listFilter)
+	}
+	if store.listFilter.ResponseStatus == nil || *store.listFilter.ResponseStatus != 502 {
+		t.Fatalf("expected response status filter 502, got %+v", store.listFilter.ResponseStatus)
+	}
+	if store.listFilter.UserID == nil || *store.listFilter.UserID != targetUserID {
+		t.Fatalf("expected user id filter %s, got %+v", targetUserID, store.listFilter.UserID)
+	}
+	if store.listFilter.RequestID == nil || *store.listFilter.RequestID != targetRequestID {
+		t.Fatalf("expected request id filter %s, got %+v", targetRequestID, store.listFilter.RequestID)
+	}
+
+	var payload struct {
+		Data []json.RawMessage `json:"data"`
+		Meta struct {
+			Count int `json:"count"`
+			Limit int `json:"limit"`
+		} `json:"meta"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload.Meta.Count != 1 || payload.Meta.Limit != 25 || len(payload.Data) != 1 {
+		t.Fatalf("unexpected response payload: %+v", payload)
+	}
+	if len(audit.finishes) != 1 || audit.finishes[0].ResponseStatus != http.StatusOK {
+		t.Fatalf("expected audited 200, got %+v", audit.finishes)
+	}
+}
+
+func TestAuditLogDetailReturnsSingleRowForAdmin(t *testing.T) {
+	adminID := uuid.New()
+	targetRequestID := uuid.New()
+	audit := &fakeAuditSink{}
+	store := &fakeAuditLogStore{
+		getItem:  json.RawMessage(`{"request_id":"` + targetRequestID.String() + `","request_body_text":"{}"}`),
+		getFound: true,
+	}
+	api := newTestServerWithAuditLogs(t, &fakeVerifier{user: User{ID: adminID}}, "http://example.test/v1", audit, store, adminID)
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/admin/audit/http-api-calls/"+targetRequestID.String(), nil)
+	request.Header.Set("Authorization", "Bearer admin-token")
+	response := httptest.NewRecorder()
+
+	api.Handler().ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", response.Code, response.Body.String())
+	}
+	if store.getID != targetRequestID {
+		t.Fatalf("expected detail request id %s, got %s", targetRequestID, store.getID)
+	}
+	if !strings.Contains(response.Body.String(), `"request_body_text":"{}"`) {
+		t.Fatalf("expected response body to contain detail payload, got %s", response.Body.String())
+	}
+}
+
 func TestProxyAcceptsSupabaseSSRCookie(t *testing.T) {
 	userID := uuid.New()
 	verifier := &fakeVerifier{user: User{ID: userID}}
@@ -437,6 +588,10 @@ func newTestServer(t *testing.T, verifier AuthVerifier, target string) *Server {
 }
 
 func newTestServerWithAudit(t *testing.T, verifier AuthVerifier, target string, auditSink AuditSink) *Server {
+	return newTestServerWithAuditLogs(t, verifier, target, auditSink, nil)
+}
+
+func newTestServerWithAuditLogs(t *testing.T, verifier AuthVerifier, target string, auditSink AuditSink, auditLogStore AuditLogStore, adminUserIDs ...uuid.UUID) *Server {
 	t.Helper()
 
 	targetURL, err := url.Parse(target)
@@ -444,11 +599,18 @@ func newTestServerWithAudit(t *testing.T, verifier AuthVerifier, target string, 
 		t.Fatalf("parse target: %v", err)
 	}
 
+	admins := make(map[uuid.UUID]struct{}, len(adminUserIDs))
+	for _, id := range adminUserIDs {
+		admins[id] = struct{}{}
+	}
+
 	return New(Options{
 		Verifier:       verifier,
 		InternalToken:  "internal-secret",
 		AuthCookieName: "sb-project-auth-token",
 		AuditSink:      auditSink,
+		AuditLogStore:  auditLogStore,
+		AdminUserIDs:   admins,
 		Routes: []Route{{
 			Name:   "assets",
 			Prefix: "/api/v1/assets",
