@@ -185,6 +185,8 @@ func auditLogWhereClause(filter AuditLogFilter) (string, []any) {
 	}
 	if filter.Route != "" {
 		add("route = $%d", filter.Route)
+	} else if filter.RequestID == nil {
+		add("(route is null or route <> $%d)", auditAdminRouteName)
 	}
 	if filter.AuthResult != "" {
 		add("auth_result = $%d", filter.AuthResult)
