@@ -19,9 +19,10 @@ import (
 )
 
 const (
-	internalTokenHeader = "X-Internal-Token"
-	userIDHeader        = "X-User-Id"
-	defaultMaxBodyBytes = 4 << 20
+	internalTokenHeader      = "X-Internal-Token"
+	userIDHeader             = "X-User-Id"
+	requestAcceptedAtHeader  = "X-Request-Accepted-At"
+	defaultMaxBodyBytes      = 4 << 20
 )
 
 type Route struct {
@@ -41,6 +42,7 @@ type Options struct {
 	AuditLogStore     AuditLogStore
 	AuditMaxBodyBytes int64
 	AdminUserIDs      map[uuid.UUID]struct{}
+	Now               func() time.Time
 }
 
 type Server struct {
@@ -54,6 +56,7 @@ type Server struct {
 	auditLogStore     AuditLogStore
 	auditMaxBodyBytes int64
 	adminUserIDs      map[uuid.UUID]struct{}
+	now               func() time.Time
 }
 
 func New(opts Options) *Server {
@@ -83,6 +86,10 @@ func New(opts Options) *Server {
 	for id := range opts.AdminUserIDs {
 		adminUserIDs[id] = struct{}{}
 	}
+	now := opts.Now
+	if now == nil {
+		now = time.Now
+	}
 
 	return &Server{
 		verifier:          opts.Verifier,
@@ -95,6 +102,7 @@ func New(opts Options) *Server {
 		auditLogStore:     auditLogStore,
 		auditMaxBodyBytes: normalizeAuditMaxBodyBytes(opts.AuditMaxBodyBytes),
 		adminUserIDs:      adminUserIDs,
+		now:               now,
 	}
 }
 
@@ -262,7 +270,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	auditEntry.AuthResult = "authenticated"
 	auditEntry.UserID = &user.ID
 
-	result, err := s.proxyAuthenticatedRequest(r, route, user)
+	acceptedAt := s.now().UTC()
+	result, err := s.proxyAuthenticatedRequest(r, route, user, acceptedAt)
 	if err != nil {
 		slog.Error(
 			"gateway upstream request failed",
@@ -393,7 +402,12 @@ type proxyResult struct {
 	TargetURL  string
 }
 
-func (s *Server) proxyAuthenticatedRequest(r *http.Request, route Route, user User) (proxyResult, error) {
+func (s *Server) proxyAuthenticatedRequest(
+	r *http.Request,
+	route Route,
+	user User,
+	acceptedAt time.Time,
+) (proxyResult, error) {
 	targetURL := buildTargetURL(route, r.URL)
 
 	request, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL.String(), r.Body)
@@ -405,6 +419,7 @@ func (s *Server) proxyAuthenticatedRequest(r *http.Request, route Route, user Us
 	request.Header.Set(internalTokenHeader, s.internalToken)
 	request.Header.Set(userIDHeader, user.ID.String())
 	request.Header.Set(requestIDHeader, requestIDFromContext(r.Context()))
+	request.Header.Set(requestAcceptedAtHeader, acceptedAt.Format(time.RFC3339Nano))
 	setForwardedHeaders(request, r)
 
 	response, err := s.client.Do(request)
@@ -512,7 +527,8 @@ func shouldDropRequestHeader(key string) bool {
 		"X-Forwarded-Host",
 		"X-Forwarded-Proto",
 		internalTokenHeader,
-		userIDHeader:
+		userIDHeader,
+		requestAcceptedAtHeader:
 		return true
 	default:
 		return false
