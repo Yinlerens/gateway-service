@@ -1,11 +1,13 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -94,6 +96,51 @@ func cloneAuditEntry(entry AuditEntry) AuditEntry {
 	entry.RequestBody.JSON = append(json.RawMessage(nil), entry.RequestBody.JSON...)
 	entry.ResponseBody.JSON = append(json.RawMessage(nil), entry.ResponseBody.JSON...)
 	return entry
+}
+
+func TestProbeEndpointsDoNotEmitAccessLogs(t *testing.T) {
+	logs := captureDefaultLogs(t)
+	handler := newTestServer(t, &fakeVerifier{}, "http://example.test/v1").Handler()
+
+	for _, path := range []string{"/health", "/ready"} {
+		logs.Reset()
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		response := httptest.NewRecorder()
+
+		handler.ServeHTTP(response, request)
+
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s: expected 200, got %d", path, response.Code)
+		}
+		if strings.Contains(logs.String(), `"msg":"http request"`) {
+			t.Fatalf("%s: expected no access log, got %s", path, logs.String())
+		}
+	}
+}
+
+func TestBusinessEndpointStillEmitsAccessLog(t *testing.T) {
+	logs := captureDefaultLogs(t)
+	api := newTestServer(t, &fakeVerifier{}, "http://example.test/v1")
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/assets/me/account", nil)
+	response := httptest.NewRecorder()
+
+	api.Handler().ServeHTTP(response, request)
+
+	if !strings.Contains(logs.String(), `"msg":"http request"`) {
+		t.Fatalf("expected business access log, got %s", logs.String())
+	}
+}
+
+func captureDefaultLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+
+	var output bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&output, nil)))
+	t.Cleanup(func() {
+		slog.SetDefault(previous)
+	})
+	return &output
 }
 
 func TestProtectedRouteRequiresLogin(t *testing.T) {
