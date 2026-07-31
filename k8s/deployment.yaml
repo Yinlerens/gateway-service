@@ -30,7 +30,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: gateway-service
-          image: ghcr.io/yinlerens/gateway-service@sha256:a2ce95bd17bb29543fde245a6cdc6b4128caac16b13b016ece4d074b5962d678
+          image: ghcr.io/yinlerens/gateway-service@sha256:2f4409372ab635a56decf05fed71741ad02e8b368e526d343372728db54ce994
           imagePullPolicy: Always
           ports:
             - name: http
