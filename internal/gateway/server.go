@@ -606,6 +606,9 @@ func (s *Server) accessLog(next http.Handler) http.Handler {
 		response := &accessLogResponseWriter{ResponseWriter: w}
 
 		next.ServeHTTP(response, r)
+		if isProbePath(r.URL.Path) {
+			return
+		}
 
 		status := response.status
 		if status == 0 {
@@ -632,6 +635,10 @@ func (s *Server) accessLog(next http.Handler) http.Handler {
 			"cf_connecting_ip", r.Header.Get("CF-Connecting-IP"),
 		)
 	})
+}
+
+func isProbePath(path string) bool {
+	return path == "/health" || path == "/ready"
 }
 
 func (s *Server) routeName(path string) string {
