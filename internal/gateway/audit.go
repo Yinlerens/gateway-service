@@ -18,6 +18,7 @@ import (
 
 const (
 	requestIDHeader             = "X-Request-Id"
+	maxClientRequestIDLength    = 128
 	defaultAuditWriteTimeout    = 3 * time.Second
 	defaultAuditMaxBodyBytes    = defaultMaxBodyBytes
 	auditStatusStarted          = "started"
@@ -202,8 +203,11 @@ func normalizeAuditMaxBodyBytes(value int64) int64 {
 
 func requestIDsFromHeader(header http.Header) (uuid.UUID, string) {
 	clientRequestID := strings.TrimSpace(header.Get(requestIDHeader))
-	if parsed, err := uuid.Parse(clientRequestID); err == nil {
-		return parsed, clientRequestID
+	if len(clientRequestID) > maxClientRequestIDLength {
+		clientRequestID = clientRequestID[:maxClientRequestIDLength]
+		if !utf8.ValidString(clientRequestID) {
+			clientRequestID = strings.ToValidUTF8(clientRequestID, "")
+		}
 	}
 	return uuid.New(), clientRequestID
 }

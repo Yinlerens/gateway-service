@@ -553,8 +553,18 @@ func shouldDropResponseHeader(key string) bool {
 }
 
 func setForwardedHeaders(dst *http.Request, src *http.Request) {
-	if clientIP := remoteIP(src.RemoteAddr); clientIP != "" {
-		dst.Header.Set("X-Forwarded-For", clientIP)
+	remote := remoteIP(src.RemoteAddr)
+	forwardedFor := strings.TrimSpace(src.Header.Get("X-Forwarded-For"))
+	if forwardedFor == "" {
+		forwardedFor = strings.TrimSpace(src.Header.Get("CF-Connecting-IP"))
+	}
+	switch {
+	case forwardedFor != "" && remote != "":
+		dst.Header.Set("X-Forwarded-For", forwardedFor+", "+remote)
+	case forwardedFor != "":
+		dst.Header.Set("X-Forwarded-For", forwardedFor)
+	case remote != "":
+		dst.Header.Set("X-Forwarded-For", remote)
 	}
 	dst.Header.Set("X-Forwarded-Host", src.Host)
 	if src.TLS != nil {
@@ -616,6 +626,10 @@ func (s *Server) accessLog(next http.Handler) http.Handler {
 			"duration_ms", time.Since(started).Milliseconds(),
 			"bytes", response.bytes,
 			"remote_ip", remoteIP(r.RemoteAddr),
+			"host", r.Host,
+			"forwarded_for", r.Header.Get("X-Forwarded-For"),
+			"cf_ray", r.Header.Get("CF-Ray"),
+			"cf_connecting_ip", r.Header.Get("CF-Connecting-IP"),
 		)
 	})
 }

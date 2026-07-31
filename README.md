@@ -28,7 +28,9 @@ Go 网关服务负责承接前端请求，在调用内部微服务之前统一�
 
 ## 接口审计
 
-网关会为所有前端业务接口生成或透传 `X-Request-Id`，并把请求/响应审计写入业务 Postgres 的 `audit.http_api_calls` 表。`/health` 和 `/ready` 只用于探针，不进入业务审计。
+网关会为每次前端业务请求生成新的权威 `request_id`，通过响应头和下游请求头 `X-Request-Id` 传递，并把请求/响应审计写入业务 Postgres 的 `audit.http_api_calls` 表。客户端传入的 `X-Request-Id` 不会成为内部主键，只会经过长度限制后记录为不可信的 `client_request_id`，用于跨端关联。`/health` 和 `/ready` 只用于探针，不进入业务审计。
+
+重复提交同一个客户端 `X-Request-Id` 仍会生成不同的 `request_id`。抽卡等写操作是否重复执行只由业务接口的 `Idempotency-Key` 决定，不能使用 `request_id` 或 `client_request_id` 充当幂等键。
 
 审计内容包括：
 
@@ -57,7 +59,7 @@ Authorization: Bearer <supabase access token>
 支持的查询参数：
 
 - `limit`：返回条数，默认 50，最大 200
-- `request_id`：精确匹配请求 ID
+- `request_id`：精确匹配网关生成的权威请求 ID
 - `user_id`：精确匹配 Supabase 用户 ID
 - `method`：HTTP 方法
 - `path`：路径包含匹配
