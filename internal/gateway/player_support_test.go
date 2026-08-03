@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -49,6 +50,7 @@ func TestPlayerSupportAggregatesAllSourcesConcurrentlyForTargetPlayer(t *testing
 	var mu sync.Mutex
 	paths := make([]string, 0, expectedUpstreamCalls)
 	headerFailures := make([]string, 0)
+	downstreamRequestIDs := make([]string, 0, expectedUpstreamCalls)
 	allStarted := make(chan struct{})
 	started := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -60,9 +62,7 @@ func TestPlayerSupportAggregatesAllSourcesConcurrentlyForTargetPlayer(t *testing
 		if r.Header.Get(internalTokenHeader) != "internal-secret" {
 			headerFailures = append(headerFailures, "wrong internal token")
 		}
-		if r.Header.Get(requestIDHeader) != requestID.String() {
-			headerFailures = append(headerFailures, "wrong request id")
-		}
+		downstreamRequestIDs = append(downstreamRequestIDs, r.Header.Get(requestIDHeader))
 		started++
 		if started == expectedUpstreamCalls {
 			close(allStarted)
@@ -79,13 +79,23 @@ func TestPlayerSupportAggregatesAllSourcesConcurrentlyForTargetPlayer(t *testing
 		case "/v1/me/account":
 			writeJSON(w, http.StatusOK, map[string]any{"user_id": targetID.String(), "balance_minor": 3200})
 		case "/v1/me/ledger":
-			writeJSON(w, http.StatusOK, map[string]any{"items": []any{map[string]any{"reason": "gacha_pull"}}})
+			writeJSON(w, http.StatusOK, map[string]any{"items": []any{map[string]any{
+				"reason":   "gacha_pull",
+				"metadata": map[string]any{"internal_note": "private-ledger-metadata"},
+			}}})
 		case "/v1/me/pulls/operations":
-			writeJSON(w, http.StatusOK, map[string]any{"items": []any{map[string]any{"status": "event_published"}}})
+			writeJSON(w, http.StatusOK, map[string]any{"items": []any{map[string]any{
+				"status":           "event_published",
+				"request_hash":     "private-request-hash",
+				"recovery_context": map[string]any{"seed": "private-recovery-seed"},
+			}}})
 		case "/v1/me/inventory":
 			writeJSON(w, http.StatusOK, map[string]any{"items": []any{map[string]any{"item_id": "character-1"}}})
 		case "/v1/me/pull-events":
-			writeJSON(w, http.StatusOK, map[string]any{"items": []any{map[string]any{"event_id": uuid.NewString()}}})
+			writeJSON(w, http.StatusOK, map[string]any{"items": []any{map[string]any{
+				"event_id": uuid.NewString(),
+				"seed":     "private-event-seed",
+			}}})
 		case "/v1/me/pull-records":
 			writeJSON(w, http.StatusOK, map[string]any{"items": []any{map[string]any{"item_name": "测试角色"}}})
 		default:
@@ -96,7 +106,7 @@ func TestPlayerSupportAggregatesAllSourcesConcurrentlyForTargetPlayer(t *testing
 
 	audit := &fakeAuditSink{}
 	auditLogs := &fakeAuditLogStore{listItems: []json.RawMessage{
-		json.RawMessage(`{"request_id":"` + uuid.NewString() + `","response_status":200}`),
+		json.RawMessage(`{"request_id":"` + uuid.NewString() + `","response_status":200,"request_body_preview":"private-request-preview","response_body_preview":"private-response-preview"}`),
 	}}
 	api := newPlayerSupportTestServer(
 		t,
@@ -123,9 +133,22 @@ func TestPlayerSupportAggregatesAllSourcesConcurrentlyForTargetPlayer(t *testing
 	if response.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", response.Code, response.Body.String())
 	}
+	responseBody := response.Body.String()
 	var payload playerSupportResponse
-	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+	if err := json.Unmarshal([]byte(responseBody), &payload); err != nil {
 		t.Fatalf("decode response: %v", err)
+	}
+	for _, privateValue := range []string{
+		"private-ledger-metadata",
+		"private-request-hash",
+		"private-recovery-seed",
+		"private-event-seed",
+		"private-request-preview",
+		"private-response-preview",
+	} {
+		if strings.Contains(responseBody, privateValue) {
+			t.Fatalf("player support response exposed private value %q: %s", privateValue, responseBody)
+		}
 	}
 	if payload.PlayerID != targetID.String() || payload.Partial {
 		t.Fatalf("unexpected response identity/partial state: %+v", payload)
@@ -147,6 +170,7 @@ func TestPlayerSupportAggregatesAllSourcesConcurrentlyForTargetPlayer(t *testing
 	mu.Lock()
 	gotPaths := append([]string(nil), paths...)
 	gotHeaderFailures := append([]string(nil), headerFailures...)
+	gotDownstreamRequestIDs := append([]string(nil), downstreamRequestIDs...)
 	mu.Unlock()
 	sort.Strings(gotPaths)
 	expectedPaths := []string{
@@ -160,6 +184,15 @@ func TestPlayerSupportAggregatesAllSourcesConcurrentlyForTargetPlayer(t *testing
 	sort.Strings(expectedPaths)
 	if len(gotHeaderFailures) != 0 {
 		t.Fatalf("unexpected downstream headers: %v", gotHeaderFailures)
+	}
+	gatewayRequestID := response.Header().Get(requestIDHeader)
+	if _, err := uuid.Parse(gatewayRequestID); err != nil {
+		t.Fatalf("expected gateway request UUID, got %q", gatewayRequestID)
+	}
+	for _, downstreamRequestID := range gotDownstreamRequestIDs {
+		if downstreamRequestID != gatewayRequestID {
+			t.Fatalf("expected downstream request id %s, got %s", gatewayRequestID, downstreamRequestID)
+		}
 	}
 	if len(gotPaths) != len(expectedPaths) {
 		t.Fatalf("expected paths %v, got %v", expectedPaths, gotPaths)
