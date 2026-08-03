@@ -19,10 +19,10 @@ import (
 )
 
 const (
-	internalTokenHeader      = "X-Internal-Token"
-	userIDHeader             = "X-User-Id"
-	requestAcceptedAtHeader  = "X-Request-Accepted-At"
-	defaultMaxBodyBytes      = 4 << 20
+	internalTokenHeader     = "X-Internal-Token"
+	userIDHeader            = "X-User-Id"
+	requestAcceptedAtHeader = "X-Request-Accepted-At"
+	defaultMaxBodyBytes     = 4 << 20
 )
 
 type Route struct {
@@ -112,6 +112,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /ready", s.handleReady)
 	mux.HandleFunc("GET /api/v1/admin/audit/http-api-calls", s.handleAuditLogList)
 	mux.HandleFunc("GET /api/v1/admin/audit/http-api-calls/{request_id}", s.handleAuditLogDetail)
+	mux.HandleFunc("GET /api/v1/admin/player-support/players/{user_id}", s.handlePlayerSupport)
 	mux.HandleFunc("/", s.handleProxy)
 	return s.accessLog(securityHeaders(mux))
 }
@@ -650,6 +651,9 @@ func (s *Server) routeName(path string) string {
 	}
 	if path == "/api/v1/admin/audit/http-api-calls" || strings.HasPrefix(path, "/api/v1/admin/audit/http-api-calls/") {
 		return auditAdminRouteName
+	}
+	if strings.HasPrefix(path, "/api/v1/admin/player-support/players/") {
+		return playerSupportAdminRouteName
 	}
 
 	route, ok := s.matchRoute(path)
