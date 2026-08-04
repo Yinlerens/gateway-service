@@ -113,6 +113,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/admin/audit/http-api-calls", s.handleAuditLogList)
 	mux.HandleFunc("GET /api/v1/admin/audit/http-api-calls/{request_id}", s.handleAuditLogDetail)
 	mux.HandleFunc("GET /api/v1/admin/player-support/players/{user_id}", s.handlePlayerSupport)
+	mux.HandleFunc("GET /api/v1/admin/player-support/players/{user_id}/pulls/{operation_id}/replay", s.handlePlayerSupportPullReplay)
 	mux.HandleFunc("/", s.handleProxy)
 	return s.accessLog(securityHeaders(mux))
 }

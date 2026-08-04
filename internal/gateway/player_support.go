@@ -15,11 +15,11 @@ import (
 )
 
 const (
-	playerSupportAdminRouteName     = "player-support-admin"
-	playerSupportSectionOK          = "ok"
-	playerSupportSectionNotFound    = "not_found"
-	playerSupportSectionUnavailable = "unavailable"
-	playerSupportAuditLogLimit      = 20
+	playerSupportAdminRouteName       = "player-support-admin"
+	playerSupportSectionOK            = "ok"
+	playerSupportSectionNotFound      = "not_found"
+	playerSupportSectionNotApplicable = "not_applicable"
+	playerSupportSectionUnavailable   = "unavailable"
 )
 
 type playerSupportResponse struct {
@@ -36,7 +36,6 @@ type playerSupportSections struct {
 	Inventory      playerSupportSection `json:"inventory"`
 	PullEvents     playerSupportSection `json:"pull_events"`
 	PullRecords    playerSupportSection `json:"pull_records"`
-	APICalls       playerSupportSection `json:"api_calls"`
 }
 
 type playerSupportSection struct {
@@ -132,20 +131,53 @@ type playerSupportPullRecord struct {
 	ReceivedAt string `json:"received_at,omitempty"`
 }
 
-type playerSupportAPICall struct {
-	RequestID      string  `json:"request_id,omitempty"`
-	StartedAt      string  `json:"started_at,omitempty"`
-	FinishedAt     *string `json:"finished_at"`
-	DurationMS     *int64  `json:"duration_ms"`
-	Method         string  `json:"method,omitempty"`
-	Path           string  `json:"path,omitempty"`
-	RawQuery       string  `json:"raw_query,omitempty"`
-	Route          *string `json:"route"`
-	AuthResult     string  `json:"auth_result,omitempty"`
-	ResponseStatus *int    `json:"response_status"`
-	ErrorCode      *string `json:"error_code"`
-	ErrorMessage   *string `json:"error_message"`
-	AuditStatus    string  `json:"audit_status,omitempty"`
+type playerSupportReplayRequest struct {
+	Source          string  `json:"source,omitempty"`
+	BannerID        *string `json:"banner_id"`
+	BannerVersionID *string `json:"banner_version_id"`
+	PityGroupID     *string `json:"pity_group_id"`
+	Count           *int    `json:"count"`
+	Seed            *string `json:"seed"`
+	EventID         *string `json:"event_id"`
+	AmountMinor     *int64  `json:"amount_minor"`
+	AcceptedAt      *string `json:"accepted_at"`
+}
+
+type playerSupportPullReplayOperation struct {
+	OperationID string                     `json:"operation_id"`
+	RequestID   *string                    `json:"request_id"`
+	Status      string                     `json:"status"`
+	Request     playerSupportReplayRequest `json:"request"`
+	Response    json.RawMessage            `json:"response"`
+	Event       json.RawMessage            `json:"event"`
+	Error       *apiError                  `json:"error"`
+	CreatedAt   string                     `json:"created_at"`
+	UpdatedAt   string                     `json:"updated_at"`
+}
+
+type playerSupportReplayPullEvent struct {
+	EventID      string          `json:"event_id,omitempty"`
+	EventType    string          `json:"event_type,omitempty"`
+	BannerID     string          `json:"banner_id,omitempty"`
+	Seed         string          `json:"seed,omitempty"`
+	StateVersion int64           `json:"state_version"`
+	PreviousPity json.RawMessage `json:"previous_pity"`
+	NextPity     json.RawMessage `json:"next_pity"`
+	ReceivedAt   string          `json:"received_at,omitempty"`
+}
+
+type playerSupportReplayBackpackDetail struct {
+	Event   playerSupportReplayPullEvent `json:"event"`
+	Records []playerSupportPullRecord    `json:"records"`
+}
+
+type playerSupportPullReplayResponse struct {
+	PlayerID         string                           `json:"player_id"`
+	GeneratedAt      time.Time                        `json:"generated_at"`
+	Partial          bool                             `json:"partial"`
+	Operation        playerSupportPullReplayOperation `json:"operation"`
+	AssetSpend       playerSupportSection             `json:"asset_spend"`
+	BackpackDelivery playerSupportSection             `json:"backpack_delivery"`
 }
 
 func (s *Server) handlePlayerSupport(w http.ResponseWriter, r *http.Request) {
@@ -211,9 +243,9 @@ func (s *Server) loadPlayerSupport(r *http.Request, playerID uuid.UUID) playerSu
 		},
 	}
 
-	results := make(chan playerSupportSectionResult, len(queries)+1)
+	results := make(chan playerSupportSectionResult, len(queries))
 	var workers sync.WaitGroup
-	workers.Add(len(queries) + 1)
+	workers.Add(len(queries))
 	for _, query := range queries {
 		query := query
 		go func() {
@@ -224,14 +256,6 @@ func (s *Server) loadPlayerSupport(r *http.Request, playerID uuid.UUID) playerSu
 			}
 		}()
 	}
-	go func() {
-		defer workers.Done()
-		results <- playerSupportSectionResult{
-			name:    "api_calls",
-			section: s.loadPlayerSupportAuditCalls(r, playerID),
-		}
-	}()
-
 	workers.Wait()
 	close(results)
 
@@ -254,8 +278,6 @@ func (s *Server) loadPlayerSupport(r *http.Request, playerID uuid.UUID) playerSu
 			response.Sections.PullEvents = result.section
 		case "pull_records":
 			response.Sections.PullRecords = result.section
-		case "api_calls":
-			response.Sections.APICalls = result.section
 		}
 	}
 
@@ -353,41 +375,6 @@ func projectPlayerSupportData(section string, body []byte) (json.RawMessage, err
 	return projected, nil
 }
 
-func (s *Server) loadPlayerSupportAuditCalls(r *http.Request, playerID uuid.UUID) playerSupportSection {
-	if s.auditLogStore == nil {
-		return unavailablePlayerSupportSection("audit_log_unavailable", "API request records are unavailable")
-	}
-
-	items, err := s.auditLogStore.ListHTTPAPICalls(r.Context(), AuditLogFilter{
-		Limit:  playerSupportAuditLogLimit,
-		UserID: &playerID,
-	})
-	if err != nil {
-		slog.Warn(
-			"player support audit query failed",
-			"player_id", playerID.String(),
-			"request_id", requestIDFromContext(r.Context()),
-			"error", err,
-		)
-		return unavailablePlayerSupportSection("audit_log_unavailable", "API request records are unavailable")
-	}
-
-	safeItems := make([]playerSupportAPICall, 0, len(items))
-	for _, item := range items {
-		var safeItem playerSupportAPICall
-		if err := json.Unmarshal(item, &safeItem); err != nil {
-			return unavailablePlayerSupportSection("audit_log_unavailable", "API request records could not be encoded")
-		}
-		safeItems = append(safeItems, safeItem)
-	}
-
-	body, err := json.Marshal(playerSupportPage[playerSupportAPICall]{Items: safeItems})
-	if err != nil {
-		return unavailablePlayerSupportSection("audit_log_unavailable", "API request records could not be encoded")
-	}
-	return playerSupportSection{Status: playerSupportSectionOK, Data: body}
-}
-
 func (s *Server) routeByName(name string) (Route, bool) {
 	for _, route := range s.routes {
 		if route.Name == name {
@@ -395,6 +382,196 @@ func (s *Server) routeByName(name string) (Route, bool) {
 		}
 	}
 	return Route{}, false
+}
+
+func (s *Server) handlePlayerSupportPullReplay(w http.ResponseWriter, r *http.Request) {
+	entry, request := s.beginDirectAudit(w, r, playerSupportAdminRouteName)
+	if !s.startAuditOrFail(w, request, entry) {
+		return
+	}
+
+	user, ok := s.authorizeAuditLogAdmin(w, request, entry)
+	if !ok {
+		return
+	}
+	entry.UserID = &user.ID
+
+	playerID, err := uuid.Parse(strings.TrimSpace(r.PathValue("user_id")))
+	if err != nil {
+		s.writeAuditedError(w, request, entry, http.StatusBadRequest, "invalid_user_id", "user_id must be a UUID")
+		return
+	}
+	operationID, err := uuid.Parse(strings.TrimSpace(r.PathValue("operation_id")))
+	if err != nil {
+		s.writeAuditedError(w, request, entry, http.StatusBadRequest, "invalid_operation_id", "operation_id must be a UUID")
+		return
+	}
+
+	body, statusCode, err := s.readPlayerSupportUpstream(
+		request,
+		playerID,
+		"gacha",
+		"/me/pulls/operations/"+url.PathEscape(operationID.String())+"/replay",
+		nil,
+	)
+	if err != nil {
+		s.writeAuditedError(w, request, entry, http.StatusBadGateway, "pull_replay_unavailable", "pull replay is unavailable")
+		return
+	}
+	if statusCode == http.StatusNotFound {
+		s.writeAuditedError(w, request, entry, http.StatusNotFound, "pull_operation_not_found", "pull operation was not found")
+		return
+	}
+	if statusCode < http.StatusOK || statusCode >= http.StatusMultipleChoices {
+		s.writeAuditedError(w, request, entry, http.StatusBadGateway, "pull_replay_unavailable", "pull replay is unavailable")
+		return
+	}
+
+	var operation playerSupportPullReplayOperation
+	if err := json.Unmarshal(body, &operation); err != nil || operation.OperationID != operationID.String() {
+		s.writeAuditedError(w, request, entry, http.StatusBadGateway, "invalid_pull_replay", "pull replay response was invalid")
+		return
+	}
+
+	assetSpend := notApplicablePlayerSupportSection("pull event has not been created")
+	backpackDelivery := notApplicablePlayerSupportSection("pull event has not been created")
+	if operation.Request.EventID != nil && strings.TrimSpace(*operation.Request.EventID) != "" {
+		eventID := strings.TrimSpace(*operation.Request.EventID)
+		results := make(chan playerSupportSectionResult, 2)
+		var workers sync.WaitGroup
+		workers.Add(2)
+		go func() {
+			defer workers.Done()
+			results <- playerSupportSectionResult{
+				name: "asset_spend",
+				section: s.loadPlayerSupportReplayEvidence(
+					request,
+					playerID,
+					"assets",
+					"/me/ledger-entry",
+					url.Values{"idempotency_key": {"spend:gacha-pull:" + eventID}},
+					"asset_spend",
+				),
+			}
+		}()
+		go func() {
+			defer workers.Done()
+			results <- playerSupportSectionResult{
+				name: "backpack_delivery",
+				section: s.loadPlayerSupportReplayEvidence(
+					request,
+					playerID,
+					"backpack",
+					"/me/pull-events/"+url.PathEscape(eventID),
+					nil,
+					"backpack_delivery",
+				),
+			}
+		}()
+		workers.Wait()
+		close(results)
+		for result := range results {
+			switch result.name {
+			case "asset_spend":
+				assetSpend = result.section
+			case "backpack_delivery":
+				backpackDelivery = result.section
+			}
+		}
+	}
+
+	response := playerSupportPullReplayResponse{
+		PlayerID:         playerID.String(),
+		GeneratedAt:      s.now().UTC(),
+		Operation:        operation,
+		AssetSpend:       assetSpend,
+		BackpackDelivery: backpackDelivery,
+	}
+	response.Partial = assetSpend.Status == playerSupportSectionUnavailable || backpackDelivery.Status == playerSupportSectionUnavailable
+	s.writeAuditedJSON(w, request, entry, http.StatusOK, response)
+}
+
+func (s *Server) loadPlayerSupportReplayEvidence(
+	r *http.Request,
+	playerID uuid.UUID,
+	routeName string,
+	path string,
+	query url.Values,
+	sectionName string,
+) playerSupportSection {
+	body, statusCode, err := s.readPlayerSupportUpstream(r, playerID, routeName, path, query)
+	if err != nil {
+		return unavailablePlayerSupportSection("upstream_unavailable", routeName+" service is unavailable")
+	}
+	if statusCode == http.StatusNotFound {
+		return playerSupportSection{Status: playerSupportSectionNotFound, Data: json.RawMessage("null")}
+	}
+	if statusCode < http.StatusOK || statusCode >= http.StatusMultipleChoices {
+		return unavailablePlayerSupportSection(fmt.Sprintf("upstream_http_%d", statusCode), routeName+" service returned an error")
+	}
+
+	var destination any
+	switch sectionName {
+	case "asset_spend":
+		destination = &playerSupportLedgerEntry{}
+	case "backpack_delivery":
+		destination = &playerSupportReplayBackpackDetail{}
+	default:
+		return unavailablePlayerSupportSection("invalid_replay_section", "replay evidence could not be decoded")
+	}
+	if err := json.Unmarshal(body, destination); err != nil {
+		return unavailablePlayerSupportSection("invalid_upstream_response", "upstream response was not valid JSON")
+	}
+	projected, err := json.Marshal(destination)
+	if err != nil {
+		return unavailablePlayerSupportSection("invalid_upstream_response", "upstream response could not be encoded")
+	}
+	return playerSupportSection{Status: playerSupportSectionOK, Data: projected}
+}
+
+func (s *Server) readPlayerSupportUpstream(
+	r *http.Request,
+	playerID uuid.UUID,
+	routeName string,
+	path string,
+	query url.Values,
+) ([]byte, int, error) {
+	route, ok := s.routeByName(routeName)
+	if !ok {
+		return nil, 0, fmt.Errorf("%s route is unavailable", routeName)
+	}
+	target := *route.Target
+	target.Path = joinURLPath(route.Target.Path, path)
+	if query != nil {
+		target.RawQuery = query.Encode()
+	}
+	request, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target.String(), nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set(internalTokenHeader, s.internalToken)
+	request.Header.Set(userIDHeader, playerID.String())
+	request.Header.Set(requestIDHeader, requestIDFromContext(r.Context()))
+
+	response, err := s.client.Do(request)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, s.maxBodyBytes+1))
+	if err != nil || int64(len(body)) > s.maxBodyBytes {
+		return nil, response.StatusCode, fmt.Errorf("upstream response could not be read")
+	}
+	return body, response.StatusCode, nil
+}
+
+func notApplicablePlayerSupportSection(message string) playerSupportSection {
+	return playerSupportSection{
+		Status: playerSupportSectionNotApplicable,
+		Data:   json.RawMessage("null"),
+		Error:  &apiError{Code: "not_applicable", Message: message},
+	}
 }
 
 func unavailablePlayerSupportSection(code string, message string) playerSupportSection {
