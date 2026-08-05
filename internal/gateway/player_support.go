@@ -308,7 +308,7 @@ func (s *Server) loadPlayerSupportUpstream(
 
 	response, err := s.client.Do(request)
 	if err != nil {
-		slog.Warn(
+		slog.WarnContext(r.Context(),
 			"player support upstream request failed",
 			"section", query.name,
 			"route", query.routeName,

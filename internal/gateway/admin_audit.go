@@ -54,7 +54,7 @@ func (s *Server) handleAuditLogList(w http.ResponseWriter, r *http.Request) {
 
 	items, err := s.auditLogStore.ListHTTPAPICalls(request.Context(), filter)
 	if err != nil {
-		slog.Error("query audit log entries failed", "request_id", entry.RequestID.String(), "error", err)
+		slog.ErrorContext(request.Context(), "query audit log entries failed", "request_id", entry.RequestID.String(), "error", err)
 		s.writeAuditedError(w, request, entry, http.StatusServiceUnavailable, "audit_log_unavailable", "audit logs are unavailable")
 		return
 	}
@@ -90,7 +90,7 @@ func (s *Server) handleAuditLogDetail(w http.ResponseWriter, r *http.Request) {
 
 	item, found, err := s.auditLogStore.GetHTTPAPICall(request.Context(), requestID)
 	if err != nil {
-		slog.Error("query audit log entry failed", "request_id", entry.RequestID.String(), "target_request_id", requestID.String(), "error", err)
+		slog.ErrorContext(request.Context(), "query audit log entry failed", "request_id", entry.RequestID.String(), "target_request_id", requestID.String(), "error", err)
 		s.writeAuditedError(w, request, entry, http.StatusServiceUnavailable, "audit_log_unavailable", "audit logs are unavailable")
 		return
 	}

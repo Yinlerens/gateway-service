@@ -11,10 +11,11 @@ import (
 	"time"
 
 	"github.com/yinlerens/gateway-service/internal/gateway"
+	"github.com/yinlerens/gateway-service/internal/telemetry"
 )
 
 func main() {
-	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+	slog.SetDefault(telemetry.NewJSONLogger(os.Stdout))
 
 	if err := run(); err != nil {
 		slog.Error("gateway service stopped", "error", err)
@@ -28,10 +29,25 @@ func run() error {
 		return err
 	}
 
+	shutdownTelemetry, err := telemetry.Setup(context.Background(), "gateway-service")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTelemetry(shutdownCtx); err != nil {
+			slog.Error("telemetry shutdown failed", "error", err)
+		}
+	}()
+
+	authClient := gateway.TimeoutClient(cfg.RequestTimeout)
+	authClient.Transport = telemetry.HTTPTransport(authClient.Transport)
+
 	verifier, err := gateway.NewSupabaseVerifier(
 		cfg.SupabaseURL,
 		cfg.SupabaseAnonKey,
-		gateway.TimeoutClient(cfg.RequestTimeout),
+		authClient,
 	)
 	if err != nil {
 		return err
@@ -48,12 +64,15 @@ func run() error {
 		defer auditSink.Close()
 	}
 
+	upstreamClient := gateway.TimeoutClient(cfg.RequestTimeout)
+	upstreamClient.Transport = telemetry.HTTPTransport(upstreamClient.Transport)
+
 	api := gateway.New(gateway.Options{
 		Verifier:          verifier,
 		InternalToken:     cfg.InternalToken,
 		AuthCookieName:    cfg.AuthCookieName,
 		Routes:            cfg.Routes,
-		Client:            gateway.TimeoutClient(cfg.RequestTimeout),
+		Client:            upstreamClient,
 		MaxBodyBytes:      cfg.MaxBodyBytes,
 		AuditSink:         auditSink,
 		AuditMaxBodyBytes: cfg.AuditMaxBodyBytes,
@@ -62,7 +81,7 @@ func run() error {
 
 	server := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           api.Handler(),
+		Handler:           telemetry.HTTPHandler(api.Handler()),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 

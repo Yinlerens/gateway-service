@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -149,6 +151,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	started := time.Now().UTC()
 	requestID, clientRequestID := requestIDsFromHeader(r.Header)
 	w.Header().Set(requestIDHeader, requestID.String())
+	span := trace.SpanFromContext(r.Context())
+	span.SetAttributes(attribute.String("app.request_id", requestID.String()))
+	if span.SpanContext().IsValid() {
+		w.Header().Set("X-Trace-Id", span.SpanContext().TraceID().String())
+	}
 	r = r.WithContext(context.WithValue(r.Context(), requestIDContextKey{}, requestID.String()))
 
 	auditEntry := AuditEntry{
@@ -167,7 +174,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	requestBody, auditBody, tooLarge, err := s.readProxyRequestBody(r)
 	auditEntry.RequestBody = auditBody
 	if err != nil {
-		slog.Warn("gateway request rejected", "reason", "request_body_unavailable", "method", r.Method, "path", r.URL.Path, "request_id", requestID.String(), "error", err)
+		slog.WarnContext(r.Context(), "gateway request rejected", "reason", "request_body_unavailable", "method", r.Method, "path", r.URL.Path, "request_id", requestID.String(), "error", err)
 		if !s.startAuditOrFail(w, r, &auditEntry) {
 			return
 		}
@@ -178,7 +185,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	r.ContentLength = int64(len(requestBody))
 
 	if tooLarge {
-		slog.Warn(
+		slog.WarnContext(r.Context(),
 			"gateway request rejected",
 			"reason", "request_too_large",
 			"method", r.Method,
@@ -200,7 +207,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	route, ok := s.matchRoute(r.URL.Path)
 	if !ok {
-		slog.Warn(
+		slog.WarnContext(r.Context(),
 			"gateway request rejected",
 			"reason", "route_not_found",
 			"method", r.Method,
@@ -215,7 +222,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	accessToken, ok := extractAccessToken(r, s.authCookieName)
 	if !ok {
-		slog.Warn(
+		slog.WarnContext(r.Context(),
 			"gateway request rejected",
 			"reason", "missing_session",
 			"method", r.Method,
@@ -228,7 +235,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.verifier == nil {
-		slog.Error(
+		slog.ErrorContext(r.Context(),
 			"gateway request rejected",
 			"reason", "auth_verifier_missing",
 			"method", r.Method,
@@ -244,7 +251,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	user, err := s.verifier.Verify(r.Context(), accessToken)
 	if err != nil {
 		if errors.Is(err, ErrInvalidSession) {
-			slog.Warn(
+			slog.WarnContext(r.Context(),
 				"gateway request rejected",
 				"reason", "invalid_session",
 				"method", r.Method,
@@ -257,7 +264,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		slog.Error(
+		slog.ErrorContext(r.Context(),
 			"gateway auth verification failed",
 			"method", r.Method,
 			"path", r.URL.Path,
@@ -275,7 +282,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	acceptedAt := s.now().UTC()
 	result, err := s.proxyAuthenticatedRequest(r, route, user, acceptedAt)
 	if err != nil {
-		slog.Error(
+		slog.ErrorContext(r.Context(),
 			"gateway upstream request failed",
 			"method", r.Method,
 			"path", r.URL.Path,
@@ -335,7 +342,7 @@ func (s *Server) startAuditOrFail(w http.ResponseWriter, r *http.Request, entry 
 	}
 
 	if err := s.auditSink.Start(r.Context(), *entry); err != nil {
-		slog.Error(
+		slog.ErrorContext(r.Context(),
 			"gateway audit start failed",
 			"method", r.Method,
 			"path", r.URL.Path,
@@ -385,7 +392,7 @@ func (s *Server) finishAudit(ctx context.Context, entry *AuditEntry) {
 	}
 
 	if err := s.auditSink.Finish(ctx, *entry); err != nil {
-		slog.Error(
+		slog.ErrorContext(ctx,
 			"gateway audit finish failed",
 			"request_id", entry.RequestID.String(),
 			"method", entry.Method,
@@ -436,7 +443,7 @@ func (s *Server) proxyAuthenticatedRequest(
 	}
 
 	if response.StatusCode >= http.StatusInternalServerError {
-		slog.Error(
+		slog.ErrorContext(r.Context(),
 			"gateway upstream returned error",
 			"method", r.Method,
 			"path", r.URL.Path,
@@ -447,7 +454,7 @@ func (s *Server) proxyAuthenticatedRequest(
 			"request_id", requestIDFromContext(r.Context()),
 		)
 	} else if response.StatusCode >= http.StatusBadRequest {
-		slog.Warn(
+		slog.WarnContext(r.Context(),
 			"gateway upstream returned client error",
 			"method", r.Method,
 			"path", r.URL.Path,
@@ -606,6 +613,10 @@ func (s *Server) accessLog(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		started := time.Now()
 		response := &accessLogResponseWriter{ResponseWriter: w}
+		spanContext := trace.SpanContextFromContext(r.Context())
+		if spanContext.IsValid() {
+			w.Header().Set("X-Trace-Id", spanContext.TraceID().String())
+		}
 
 		next.ServeHTTP(response, r)
 		if isProbePath(r.URL.Path) {
@@ -620,8 +631,11 @@ func (s *Server) accessLog(next http.Handler) http.Handler {
 		if requestID == "" {
 			requestID = response.Header().Get(requestIDHeader)
 		}
+		if requestID != "" {
+			trace.SpanFromContext(r.Context()).SetAttributes(attribute.String("app.request_id", requestID))
+		}
 
-		slog.Info(
+		slog.InfoContext(r.Context(),
 			"http request",
 			"request_id", requestID,
 			"method", r.Method,

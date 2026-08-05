@@ -12,6 +12,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/exaring/otelpgx"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -82,6 +83,7 @@ func NewPostgresAuditSink(ctx context.Context, databaseURL string, writeTimeout 
 	}
 	config.MaxConns = 4
 	config.MinConns = 0
+	config.ConnConfig.Tracer = otelpgx.NewTracer()
 
 	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
